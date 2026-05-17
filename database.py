@@ -28,6 +28,7 @@ class Database:
                     is_paused   INTEGER DEFAULT 0,
                     age_min     INTEGER DEFAULT 18,
                     age_max     INTEGER DEFAULT 99,
+                    status      TEXT DEFAULT 'pending',
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -48,13 +49,23 @@ class Database:
                     user_id     INTEGER PRIMARY KEY,
                     last_shown  INTEGER
                 );
+
+                CREATE TABLE IF NOT EXISTS pending_edits (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id     INTEGER NOT NULL,
+                    field       TEXT NOT NULL,
+                    new_value   TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
-            # Migration: add age_min/age_max if upgrading from old schema
+            # Migrations for old schemas
             cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
             if "age_min" not in cols:
                 conn.execute("ALTER TABLE users ADD COLUMN age_min INTEGER DEFAULT 18")
             if "age_max" not in cols:
                 conn.execute("ALTER TABLE users ADD COLUMN age_max INTEGER DEFAULT 99")
+            if "status" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'approved'")
 
     # ── Users ──────────────────────────────────────────────────────────────
 
@@ -64,8 +75,8 @@ class Database:
         with self._conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO users
-                  (user_id, username, name, age, gender, looking_for, city, goal, bio, photo_id, age_min, age_max)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (user_id, username, name, age, gender, looking_for, city, goal, bio, photo_id, age_min, age_max, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             """, (user_id, username, name, age, gender, looking_for, city, goal, bio, photo_id, age_min, age_max))
 
     def get_user(self, user_id: int) -> Optional[dict]:
@@ -83,18 +94,50 @@ class Database:
         with self._conn() as conn:
             conn.execute(f"UPDATE users SET {fields} WHERE user_id = ?", values)
 
+    def approve_user(self, user_id: int):
+        self.update_user(user_id, status='approved')
+
+    def reject_user(self, user_id: int):
+        self.update_user(user_id, status='rejected')
+
+    def get_pending_users(self) -> list:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users WHERE status = 'pending' ORDER BY created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Pending edits ──────────────────────────────────────────────────────
+
+    def add_pending_edit(self, user_id: int, field: str, new_value: str) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO pending_edits (user_id, field, new_value) VALUES (?, ?, ?)",
+                (user_id, field, new_value)
+            )
+            return cur.lastrowid
+
+    def get_pending_edit(self, edit_id: int) -> Optional[dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_edits WHERE id = ?", (edit_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_pending_edit(self, edit_id: int):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM pending_edits WHERE id = ?", (edit_id,))
+
+    def get_pending_edits(self) -> list:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT pe.*, u.name FROM pending_edits pe JOIN users u ON pe.user_id = u.user_id ORDER BY pe.created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Matching logic ─────────────────────────────────────────────────────
 
     def get_next_candidate(self, user_id: int) -> Optional[dict]:
-        """
-        Find next profile matching:
-        - Same city
-        - Gender matches what user is looking for
-        - User matches what candidate is looking for
-        - Not already liked/skipped
-        - Not paused
-        - Not the user themselves
-        """
         me = self.get_user(user_id)
         if not me:
             return None
@@ -104,6 +147,7 @@ class Database:
                 SELECT u.* FROM users u
                 WHERE u.user_id != ?
                   AND u.is_paused = 0
+                  AND u.status = 'approved'
                   AND LOWER(u.city) = LOWER(?)
                   AND (? = 'any' OR u.gender = ?)
                   AND (u.looking_for = 'any' OR u.looking_for = ?)
@@ -132,7 +176,6 @@ class Database:
             return None
 
         candidate = dict(row)
-        # Track last shown
         with self._conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO shown (user_id, last_shown) VALUES (?, ?)

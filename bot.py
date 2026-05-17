@@ -16,6 +16,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8455223149:AAF4eBAnW9-z96rpY5fU4ceSoLK4F7tZTf4")
+# ID администратора — замените на свой Telegram ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1697156984"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -76,6 +78,22 @@ def kb_edit_profile():
     builder.adjust(2)
     return builder.as_markup()
 
+def kb_moderate_user(user_id: int):
+    """Admin buttons for new profile moderation."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Одобрить", callback_data=f"mod_approve_{user_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"mod_reject_{user_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def kb_moderate_edit(edit_id: int):
+    """Admin buttons for edit moderation."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Одобрить", callback_data=f"edit_approve_{edit_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"edit_reject_{edit_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
 GOALS_TEXT = {
     "serious": "❤️ Серьёзные отношения",
     "casual": "😊 Лёгкое общение",
@@ -84,6 +102,15 @@ GOALS_TEXT = {
 }
 
 GENDER_TEXT = {"male": "👨 Мужчина", "female": "👩 Женщина"}
+
+EDIT_FIELD_NAMES = {
+    "bio": "📖 О себе",
+    "photo_id": "🖼 Фото",
+    "name": "📝 Имя",
+    "age": "🎂 Возраст",
+    "city": "🏙 Город",
+    "goal": "🎯 Цель",
+}
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -113,7 +140,6 @@ async def send_profile(chat_id: int, user: dict, markup=None, show_filter: bool 
         await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
 
 async def show_next_profile(message_or_call, user_id: int):
-    """Show next profile for browsing."""
     candidate = db.get_next_candidate(user_id)
     chat_id = message_or_call.from_user.id if hasattr(message_or_call, "from_user") else message_or_call.message.chat.id
 
@@ -122,6 +148,58 @@ async def show_next_profile(message_or_call, user_id: int):
         return
 
     await send_profile(chat_id, candidate, markup=kb_profile_actions())
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+# ─── SEND PROFILE TO ADMIN FOR MODERATION ────────────────────────────────────
+
+async def send_to_admin_for_moderation(user: dict):
+    """Send new profile to admin with Approve/Reject buttons."""
+    text = (
+        f"🆕 <b>Новая анкета на модерации</b>\n\n"
+        f"{format_profile(user)}\n\n"
+        f"👤 ID: <code>{user['user_id']}</code>\n"
+        f"@{user.get('username') or '—'}"
+    )
+    photo = user.get("photo_id")
+    markup = kb_moderate_user(user["user_id"])
+    try:
+        if photo:
+            await bot.send_photo(ADMIN_ID, photo, caption=text, parse_mode="HTML", reply_markup=markup)
+        else:
+            await bot.send_message(ADMIN_ID, text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Не удалось отправить анкету админу: {e}")
+
+async def send_edit_to_admin(user: dict, field: str, new_value: str, edit_id: int):
+    """Notify admin about a profile edit that needs moderation."""
+    field_name = EDIT_FIELD_NAMES.get(field, field)
+    text = (
+        f"✏️ <b>Правка анкеты на модерации</b>\n\n"
+        f"Пользователь: <b>{user['name']}</b> (ID: <code>{user['user_id']}</code>)\n"
+        f"Поле: {field_name}\n"
+    )
+    markup = kb_moderate_edit(edit_id)
+    try:
+        if field == "photo_id" and new_value:
+            await bot.send_photo(
+                ADMIN_ID, new_value,
+                caption=text + "↑ Новое фото",
+                parse_mode="HTML",
+                reply_markup=markup
+            )
+        else:
+            display = GOALS_TEXT.get(new_value, new_value) if field == "goal" else new_value
+            await bot.send_message(
+                ADMIN_ID,
+                text + f"Новое значение: <b>{display or '(пусто)'}</b>",
+                parse_mode="HTML",
+                reply_markup=markup
+            )
+    except Exception as e:
+        logger.error(f"Не удалось отправить правку админу: {e}")
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -132,17 +210,43 @@ async def cmd_start(message: Message, state: FSMContext):
     existing = db.get_user(user_id)
 
     if existing:
-        await message.answer(
-            f"👋 С возвращением, <b>{existing['name']}</b>!\nЧто будем делать?",
-            parse_mode="HTML",
-            reply_markup=kb_main_menu()
-        )
+        status = existing.get("status", "approved")
+        if status == "pending":
+            await message.answer(
+                f"👋 С возвращением, <b>{existing['name']}</b>!\n\n"
+                "⏳ Твоя анкета пока на модерации. Мы уведомим тебя, как только она будет проверена.",
+                parse_mode="HTML"
+            )
+        elif status == "rejected":
+            await message.answer(
+                f"👋 С возвращением, <b>{existing['name']}</b>!\n\n"
+                "❌ К сожалению, твоя анкета была отклонена модератором.\n"
+                "Напиши /new_profile чтобы создать анкету заново.",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(
+                f"👋 С возвращением, <b>{existing['name']}</b>!\nЧто будем делать?",
+                parse_mode="HTML",
+                reply_markup=kb_main_menu()
+            )
         return
 
     await message.answer(
         "👋 Привет! Это бот знакомств.\n\nДавай создадим твою анкету.\n\n<b>Как тебя зовут?</b>",
         parse_mode="HTML"
     )
+    await state.set_state(Registration.name)
+
+
+@dp.message(Command("new_profile"))
+async def cmd_new_profile(message: Message, state: FSMContext):
+    """Allow rejected users to re-register."""
+    user = db.get_user(message.from_user.id)
+    if user and user.get("status") != "rejected":
+        await message.answer("У тебя уже есть активная или ожидающая проверки анкета.")
+        return
+    await message.answer("Давай создадим новую анкету.\n\n<b>Как тебя зовут?</b>", parse_mode="HTML")
     await state.set_state(Registration.name)
 
 
@@ -265,28 +369,181 @@ async def reg_photo(message: Message, state: FSMContext):
         goal=data["goal"],
         bio=data.get("bio"),
         photo_id=photo_id,
+        username=message.from_user.username,
         age_min=data.get("age_min", 18),
         age_max=data.get("age_max", 99),
     )
     await state.clear()
 
     user = db.get_user(user_id)
-    await message.answer("✅ Анкета создана!\n\nВот как она выглядит:")
+    await message.answer("✅ Анкета отправлена на модерацию!\n\nВот как она выглядит:")
     await send_profile(message.chat.id, user)
-    await message.answer("Всё верно? Начнём поиск! 🚀", reply_markup=kb_main_menu())
+    await message.answer(
+        "⏳ Ожидай проверки от администратора. Мы уведомим тебя о результате.",
+        reply_markup=kb_main_menu()
+    )
+
+    # Notify admin
+    await send_to_admin_for_moderation(user)
 
 @dp.message(Registration.photo)
 async def reg_photo_wrong(message: Message):
     await message.answer("Пожалуйста, отправь фото или напиши /skip")
 
 
+# ─── ADMIN: MODERATION ────────────────────────────────────────────────────────
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    pending_profiles = db.get_pending_users()
+    pending_edits = db.get_pending_edits()
+    text = (
+        f"🛡 <b>Панель администратора</b>\n\n"
+        f"⏳ Анкет на проверке: <b>{len(pending_profiles)}</b>\n"
+        f"✏️ Правок на проверке: <b>{len(pending_edits)}</b>"
+    )
+    builder = InlineKeyboardBuilder()
+    if pending_profiles:
+        builder.button(text=f"📋 Показать анкеты ({len(pending_profiles)})", callback_data="admin_show_pending")
+    if pending_edits:
+        builder.button(text=f"✏️ Показать правки ({len(pending_edits)})", callback_data="admin_show_edits")
+    builder.adjust(1)
+    await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup() if pending_profiles or pending_edits else None)
+
+@dp.callback_query(F.data == "admin_show_pending")
+async def admin_show_pending(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    pending = db.get_pending_users()
+    if not pending:
+        await call.answer("Нет анкет на проверке")
+        return
+    await call.answer()
+    for user in pending:
+        await send_to_admin_for_moderation(user)
+
+@dp.callback_query(F.data == "admin_show_edits")
+async def admin_show_edits(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    edits = db.get_pending_edits()
+    if not edits:
+        await call.answer("Нет правок на проверке")
+        return
+    await call.answer()
+    for edit in edits:
+        user = db.get_user(edit["user_id"])
+        if user:
+            await send_edit_to_admin(user, edit["field"], edit["new_value"], edit["id"])
+
+# ── Approve / Reject new profile ──
+
+@dp.callback_query(F.data.startswith("mod_approve_"))
+async def mod_approve(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    user_id = int(call.data.replace("mod_approve_", ""))
+    db.approve_user(user_id)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("✅ Одобрено")
+    await call.message.reply(f"✅ Анкета пользователя {user_id} одобрена.")
+    # Notify user
+    try:
+        await bot.send_message(
+            user_id,
+            "🎉 Твоя анкета прошла модерацию и теперь активна!\n\nМожешь начинать знакомиться 🚀",
+            reply_markup=kb_main_menu()
+        )
+    except Exception as e:
+        logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
+
+@dp.callback_query(F.data.startswith("mod_reject_"))
+async def mod_reject(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    user_id = int(call.data.replace("mod_reject_", ""))
+    db.reject_user(user_id)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("❌ Отклонено")
+    await call.message.reply(f"❌ Анкета пользователя {user_id} отклонена.")
+    try:
+        await bot.send_message(
+            user_id,
+            "😔 Твоя анкета не прошла модерацию.\n\n"
+            "Напиши /new_profile чтобы создать анкету заново и учесть замечания."
+        )
+    except Exception as e:
+        logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
+
+# ── Approve / Reject edit ──
+
+@dp.callback_query(F.data.startswith("edit_approve_"))
+async def edit_approve(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    edit_id = int(call.data.replace("edit_approve_", ""))
+    edit = db.get_pending_edit(edit_id)
+    if not edit:
+        await call.answer("Правка не найдена (уже обработана?)")
+        return
+    # Apply the edit
+    db.update_user(edit["user_id"], **{edit["field"]: edit["new_value"]})
+    db.delete_pending_edit(edit_id)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("✅ Правка принята")
+    field_name = EDIT_FIELD_NAMES.get(edit["field"], edit["field"])
+    try:
+        await bot.send_message(
+            edit["user_id"],
+            f"✅ Твоя правка поля «{field_name}» одобрена и применена!",
+            reply_markup=kb_main_menu()
+        )
+    except Exception as e:
+        logger.error(e)
+
+@dp.callback_query(F.data.startswith("edit_reject_"))
+async def edit_reject(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    edit_id = int(call.data.replace("edit_reject_", ""))
+    edit = db.get_pending_edit(edit_id)
+    if not edit:
+        await call.answer("Правка не найдена")
+        return
+    db.delete_pending_edit(edit_id)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("❌ Правка отклонена")
+    field_name = EDIT_FIELD_NAMES.get(edit["field"], edit["field"])
+    try:
+        await bot.send_message(
+            edit["user_id"],
+            f"❌ Твоя правка поля «{field_name}» была отклонена модератором."
+        )
+    except Exception as e:
+        logger.error(e)
+
+
 # ─── MAIN MENU ───────────────────────────────────────────────────────────────
+
+def _check_approved(user) -> str | None:
+    """Returns error message if user can't browse, else None."""
+    if not user:
+        return "Сначала создай анкету — /start"
+    status = user.get("status", "approved")
+    if status == "pending":
+        return "⏳ Твоя анкета ещё на модерации. Ожидай уведомления."
+    if status == "rejected":
+        return "❌ Твоя анкета была отклонена. Напиши /new_profile чтобы создать новую."
+    return None
 
 @dp.message(F.text == "🔍 Смотреть анкеты")
 async def browse_profiles(message: Message):
     user = db.get_user(message.from_user.id)
-    if not user:
-        await message.answer("Сначала создай анкету — /start")
+    err = _check_approved(user)
+    if err:
+        await message.answer(err)
         return
     if user.get("is_paused"):
         await message.answer("Ты на паузе. Нажми «⏸ Пауза / ▶️ Продолжить» чтобы возобновить поиск.")
@@ -299,7 +556,10 @@ async def my_profile(message: Message):
     if not user:
         await message.answer("Сначала создай анкету — /start")
         return
+    status = user.get("status", "approved")
+    status_label = {"pending": "⏳ На модерации", "approved": "✅ Активна", "rejected": "❌ Отклонена"}.get(status, status)
     await send_profile(message.chat.id, user, markup=kb_edit_profile(), show_filter=True)
+    await message.answer(f"Статус анкеты: {status_label}")
 
 @dp.message(F.text == "⏸ Пауза / ▶️ Продолжить")
 async def toggle_pause(message: Message):
@@ -324,7 +584,6 @@ async def edit_profile_menu(message: Message):
 @dp.callback_query(F.data == "swipe_like")
 async def swipe_like(call: CallbackQuery):
     user_id = call.from_user.id
-    # Get the profile shown (last viewed)
     target_id = db.get_last_shown(user_id)
     if not target_id:
         await call.answer("Что-то пошло не так")
@@ -333,7 +592,6 @@ async def swipe_like(call: CallbackQuery):
     db.add_like(user_id, target_id)
     await call.answer("❤️ Лайк!")
 
-    # Check for mutual like
     if db.is_mutual_like(user_id, target_id):
         me = db.get_user(user_id)
         them = db.get_user(target_id)
@@ -368,6 +626,9 @@ async def swipe_skip(call: CallbackQuery):
 
 # ─── EDIT PROFILE ────────────────────────────────────────────────────────────
 
+# Fields that require moderation when edited
+MODERATED_EDIT_FIELDS = {"bio", "photo", "name"}
+
 @dp.callback_query(F.data.startswith("edit_"))
 async def edit_field(call: CallbackQuery, state: FSMContext):
     field = call.data.replace("edit_", "")
@@ -396,6 +657,8 @@ async def edit_field(call: CallbackQuery, state: FSMContext):
         return
     if field in prompts:
         text, st = prompts[field]
+        if field in MODERATED_EDIT_FIELDS:
+            text += "\n\n⚠️ Это поле требует проверки модератором."
         await call.message.answer(text)
         await state.set_state(st)
         await call.answer()
@@ -406,9 +669,14 @@ async def edit_name(message: Message, state: FSMContext):
     if len(name) < 2 or len(name) > 30:
         await message.answer("Имя от 2 до 30 символов:")
         return
-    db.update_user(message.from_user.id, name=name)
+    user = db.get_user(message.from_user.id)
+    edit_id = db.add_pending_edit(message.from_user.id, "name", name)
     await state.clear()
-    await message.answer(f"✅ Имя обновлено: <b>{name}</b>", parse_mode="HTML", reply_markup=kb_main_menu())
+    await message.answer(
+        f"✅ Новое имя «<b>{name}</b>» отправлено на модерацию. Оно будет применено после проверки.",
+        parse_mode="HTML", reply_markup=kb_main_menu()
+    )
+    await send_edit_to_admin(user, "name", name, edit_id)
 
 @dp.message(EditProfile.age)
 async def edit_age(message: Message, state: FSMContext):
@@ -418,6 +686,7 @@ async def edit_age(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("Введи корректный возраст (18–99):")
         return
+    # Age applied immediately (no moderation needed)
     db.update_user(message.from_user.id, age=age)
     await state.clear()
     await message.answer(f"✅ Возраст обновлён: <b>{age}</b>", parse_mode="HTML", reply_markup=kb_main_menu())
@@ -425,6 +694,7 @@ async def edit_age(message: Message, state: FSMContext):
 @dp.message(EditProfile.city)
 async def edit_city(message: Message, state: FSMContext):
     city = message.text.strip().title()
+    # City applied immediately
     db.update_user(message.from_user.id, city=city)
     await state.clear()
     await message.answer(f"✅ Город обновлён: <b>{city}</b>", parse_mode="HTML", reply_markup=kb_main_menu())
@@ -432,6 +702,7 @@ async def edit_city(message: Message, state: FSMContext):
 @dp.callback_query(EditProfile.goal, F.data.startswith("goal_"))
 async def edit_goal(call: CallbackQuery, state: FSMContext):
     goal = call.data.replace("goal_", "")
+    # Goal applied immediately
     db.update_user(call.from_user.id, goal=goal)
     await state.clear()
     await call.message.edit_text(f"✅ Цель обновлена: <b>{GOALS_TEXT[goal]}</b>", parse_mode="HTML")
@@ -441,22 +712,36 @@ async def edit_goal(call: CallbackQuery, state: FSMContext):
 @dp.message(EditProfile.bio)
 async def edit_bio(message: Message, state: FSMContext):
     bio = None if message.text == "/skip" else message.text.strip()[:300]
-    db.update_user(message.from_user.id, bio=bio)
+    user = db.get_user(message.from_user.id)
+    edit_id = db.add_pending_edit(message.from_user.id, "bio", bio)
     await state.clear()
-    await message.answer("✅ Описание обновлено!", reply_markup=kb_main_menu())
+    await message.answer(
+        "✅ Описание отправлено на модерацию. Будет применено после проверки.",
+        reply_markup=kb_main_menu()
+    )
+    await send_edit_to_admin(user, "bio", bio, edit_id)
 
 @dp.message(EditProfile.photo, Command("skip"))
 @dp.message(EditProfile.photo, F.photo)
 async def edit_photo(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id if message.photo else None
-    db.update_user(message.from_user.id, photo_id=photo_id)
+    user = db.get_user(message.from_user.id)
+    edit_id = db.add_pending_edit(message.from_user.id, "photo_id", photo_id)
     await state.clear()
-    await message.answer("✅ Фото обновлено!", reply_markup=kb_main_menu())
+    await message.answer(
+        "✅ Фото отправлено на модерацию. Будет применено после проверки.",
+        reply_markup=kb_main_menu()
+    )
+    if photo_id:
+        await send_edit_to_admin(user, "photo_id", photo_id, edit_id)
+    else:
+        db.update_user(message.from_user.id, photo_id=None)
+        db.delete_pending_edit(edit_id)
+        await message.answer("Фото удалено.")
 
 @dp.message(EditProfile.photo)
 async def edit_photo_wrong(message: Message):
     await message.answer("Пожалуйста, отправь фото или напиши /skip")
-
 
 @dp.message(EditProfile.age_min)
 async def edit_age_min(message: Message, state: FSMContext):
