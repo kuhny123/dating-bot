@@ -12,6 +12,7 @@ class Registration(StatesGroup):
     goal = State()
     bio = State()
     photo = State()
+    verification = State()  # видео-кружок для модерации
 
 
 class EditProfile(StatesGroup):

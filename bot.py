@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import logging
 import os
 from aiogram import Bot, Dispatcher, F
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8455223149:AAF4eBAnW9-z96rpY5fU4ceSoLK4F7tZTf4")
 # ID администратора — замените на свой Telegram ID
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1697156984"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -155,8 +155,8 @@ def is_admin(user_id: int) -> bool:
 
 # ─── SEND PROFILE TO ADMIN FOR MODERATION ────────────────────────────────────
 
-async def send_to_admin_for_moderation(user: dict):
-    """Send new profile to admin with Approve/Reject buttons."""
+async def send_to_admin_for_moderation(user: dict, video_note_id: str = None):
+    """Send new profile to admin with Approve/Reject buttons, plus verification video note."""
     text = (
         f"🆕 <b>Новая анкета на модерации</b>\n\n"
         f"{format_profile(user)}\n\n"
@@ -170,6 +170,10 @@ async def send_to_admin_for_moderation(user: dict):
             await bot.send_photo(ADMIN_ID, photo, caption=text, parse_mode="HTML", reply_markup=markup)
         else:
             await bot.send_message(ADMIN_ID, text, parse_mode="HTML", reply_markup=markup)
+        # Forward verification video note separately
+        if video_note_id:
+            await bot.send_message(ADMIN_ID, "🎥 Верификационный кружок:")
+            await bot.send_video_note(ADMIN_ID, video_note_id)
     except Exception as e:
         logger.error(f"Не удалось отправить анкету админу: {e}")
 
@@ -356,8 +360,26 @@ async def reg_photo(message: Message, state: FSMContext):
         photo_id = message.photo[-1].file_id
     await state.update_data(photo_id=photo_id)
 
+    await message.answer(
+        "🎥 <b>Последний шаг — верификация!</b>\n\n"
+        "Запиши и отправь <b>видео-кружок</b> (видеосообщение), в котором ты:\n\n"
+        "1️⃣ Чётко произносишь слово <b>«Vector»</b>\n"
+        "2️⃣ Показываешь любой жест рукой (👋 помахать, ✌️ два пальца, 👍 палец вверх и т.д.)\n\n"
+        "Это нужно для подтверждения, что ты живой человек. "
+        "Кружок увидит только администратор.",
+        parse_mode="HTML"
+    )
+    await state.set_state(Registration.verification)
+
+@dp.message(Registration.photo)
+async def reg_photo_wrong(message: Message):
+    await message.answer("Пожалуйста, отправь фото или напиши /skip")
+
+@dp.message(Registration.verification, F.video_note)
+async def reg_verification(message: Message, state: FSMContext):
     data = await state.get_data()
     user_id = message.from_user.id
+    video_note_id = message.video_note.file_id
 
     db.create_user(
         user_id=user_id,
@@ -368,7 +390,7 @@ async def reg_photo(message: Message, state: FSMContext):
         city=data["city"],
         goal=data["goal"],
         bio=data.get("bio"),
-        photo_id=photo_id,
+        photo_id=data.get("photo_id"),
         username=message.from_user.username,
         age_min=data.get("age_min", 18),
         age_max=data.get("age_max", 99),
@@ -376,19 +398,23 @@ async def reg_photo(message: Message, state: FSMContext):
     await state.clear()
 
     user = db.get_user(user_id)
-    await message.answer("✅ Анкета отправлена на модерацию!\n\nВот как она выглядит:")
+    await message.answer("✅ Анкета и верификация отправлены на проверку!\n\nВот как выглядит твоя анкета:")
     await send_profile(message.chat.id, user)
     await message.answer(
         "⏳ Ожидай проверки от администратора. Мы уведомим тебя о результате.",
         reply_markup=kb_main_menu()
     )
 
-    # Notify admin
-    await send_to_admin_for_moderation(user)
+    # Notify admin: send profile + verification video note
+    await send_to_admin_for_moderation(user, video_note_id=video_note_id)
 
-@dp.message(Registration.photo)
-async def reg_photo_wrong(message: Message):
-    await message.answer("Пожалуйста, отправь фото или напиши /skip")
+@dp.message(Registration.verification)
+async def reg_verification_wrong(message: Message):
+    await message.answer(
+        "Пожалуйста, отправь именно <b>видео-кружок</b> 🎥\n\n"
+        "Нажми на микрофон в Telegram → зажми → переключись на камеру (кружок).",
+        parse_mode="HTML"
+    )
 
 
 # ─── ADMIN: MODERATION ────────────────────────────────────────────────────────
@@ -787,4 +813,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
