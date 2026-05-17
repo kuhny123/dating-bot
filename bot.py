@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 import os
 from aiogram import Bot, Dispatcher, F
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8455223149:AAF4eBAnW9-z96rpY5fU4ceSoLK4F7tZTf4")
 # ID администратора — замените на свой Telegram ID
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1697156984"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
